@@ -1,134 +1,399 @@
-import 'package:path/path.dart' as p;
+
+import 'package:path/path.dart';
 import 'package:sqflite/sqflite.dart';
 
-/// เปิด/สร้างฐานข้อมูล SQLite ในเครื่อง พร้อม seed รายการเริ่มต้น
-/// สามารถ inject factory/path สำหรับใช้ใน unit test ได้
 class AppDb {
-  AppDb({this.factory, this.path});
+  AppDb._internal()
+      : _factory = null,
+        _customPath = null;
 
-  static final AppDb instance = AppDb();
+  /// สร้างฐานข้อมูลแยกสำหรับการทดสอบ
+  AppDb.forTesting({
+    required DatabaseFactory factory,
+    required String path,
+  })  : _factory = factory,
+        _customPath = path;
 
-  final DatabaseFactory? factory;
-  final String? path;
-  Database? _db;
+  /// ฐานข้อมูลหลักของแอป
+  static final AppDb instance = AppDb._internal();
+
+  final DatabaseFactory? _factory;
+  final String? _customPath;
+
+  Database? _database;
+
+  static const String _databaseName = 'water_world.db';
+  static const int _databaseVersion = 4;
+
+  // --------------------------------------------------
+  // DATABASE
+  // --------------------------------------------------
 
   Future<Database> get database async {
-    final existing = _db;
-    if (existing != null) return existing;
-    final db = await (factory ?? databaseFactory).openDatabase(
-      path ?? p.join(await getDatabasesPath(), 'water_world.db'),
+    if (_database != null && _database!.isOpen) {
+      return _database!;
+    }
+
+    final String path;
+
+    if (_customPath != null) {
+      path = _customPath!;
+    } else {
+      final dbPath = await getDatabasesPath();
+      path = join(dbPath, _databaseName);
+    }
+
+    print('WATER WORLD DB PATH: $path');
+
+    final factory = _factory ?? databaseFactory;
+
+    _database = await factory.openDatabase(
+      path,
       options: OpenDatabaseOptions(
-        version: 1,
-        onCreate: (db, _) async {
-          // บน Android execute รันได้ทีละ 1 statement จึงต้อง split เอง
-          for (final stmt in _schema.split(';')) {
-            final s = stmt.trim();
-            if (s.isNotEmpty) await db.execute(s);
-          }
-          await _seed(db);
+        version: _databaseVersion,
+        onCreate: (db, version) async {
+          await _createSchema(db);
+        },
+        onUpgrade: (db, oldVersion, newVersion) async {
+          await _createSchema(db);
+        },
+        onOpen: (db) async {
+          await _ensureAllColumns(db);
         },
       ),
     );
-    _db = db;
-    return db;
+
+    await _createSchema(_database!);
+    await _ensureAllColumns(_database!);
+    await _seed(_database!);
+
+    return _database!;
   }
 
-  static const _schema = '''
-CREATE TABLE items (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  code TEXT UNIQUE NOT NULL,
-  name TEXT NOT NULL,
-  item_type TEXT NOT NULL CHECK (item_type IN ('raw_material','finished_good')),
-  unit TEXT NOT NULL,
-  current_quantity REAL NOT NULL DEFAULT 0,
-  unit_cost REAL NOT NULL DEFAULT 0,
-  min_quantity REAL NOT NULL DEFAULT 0,
-  safety_stock REAL NOT NULL DEFAULT 0,
-  reserved_quantity REAL NOT NULL DEFAULT 0,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
-);
-CREATE TABLE recipes (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  finished_good_id INTEGER NOT NULL REFERENCES items (id),
-  raw_material_id INTEGER NOT NULL REFERENCES items (id),
-  quantity_per_unit REAL NOT NULL
-);
-CREATE TABLE production_batches (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  batch_number TEXT UNIQUE NOT NULL,
-  finished_good_id INTEGER NOT NULL REFERENCES items (id),
-  quantity_produced REAL NOT NULL,
-  note TEXT,
-  created_at TEXT NOT NULL
-);
-CREATE TABLE stock_transactions (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  item_id INTEGER NOT NULL REFERENCES items (id),
-  transaction_type TEXT NOT NULL,
-  quantity_change REAL NOT NULL,
-  quantity_before REAL NOT NULL,
-  quantity_after REAL NOT NULL,
-  unit_price_or_cost REAL,
-  reference_id TEXT,
-  note TEXT,
-  created_at TEXT NOT NULL
-);
-CREATE INDEX idx_tx_item ON stock_transactions (item_id);
-CREATE INDEX idx_tx_created ON stock_transactions (created_at);
-''';
-
-  static Future<void> _seed(DatabaseExecutor db) async {
-    final now = DateTime.now().toIso8601String();
-
-    Future<void> item(String code, String name, String type, String unit) =>
-        db.insert('items', {
-          'code': code,
-          'name': name,
-          'item_type': type,
-          'unit': unit,
-          'created_at': now,
-          'updated_at': now,
-        });
-
-    // วัตถุดิบ
-    await item('PET_350', 'ขวดพลาสติก PET 350 ml', 'raw_material', 'ขวด');
-    await item('PET_600', 'ขวดพลาสติก PET 600 ml', 'raw_material', 'ขวด');
-    await item('PET_1500', 'ขวดพลาสติก PET 1500 ml', 'raw_material', 'ขวด');
-    await item('CAP_SCREW', 'ฝาขวดเกลียว', 'raw_material', 'ฝา');
-    await item('PVC_FILM', 'ฟิล์มหด PVC', 'raw_material', 'แผ่น');
-    await item('PE_FILM', 'ฟิล์มหด PE', 'raw_material', 'แผ่น');
-
-    // สินค้าสำเร็จรูป
-    await item('WATER_350_12', 'น้ำดื่ม 350 ml แพ็ก 12 ขวด', 'finished_good', 'แพ็ก');
-    await item('WATER_600_12', 'น้ำดื่ม 600 ml แพ็ก 12 ขวด', 'finished_good', 'แพ็ก');
-    await item('WATER_1500_6', 'น้ำดื่ม 1500 ml แพ็ก 6 ขวด', 'finished_good', 'แพ็ก');
-
-    Future<int> idOf(String code) async {
-      final rows = await db.query('items',
-          columns: ['id'], where: 'code = ?', whereArgs: [code], limit: 1);
-      return rows.first['id'] as int;
+  /// ปิดฐานข้อมูล ใช้สำหรับการทดสอบหรือปิดการใช้งาน
+  Future<void> close() async {
+    if (_database != null && _database!.isOpen) {
+      await _database!.close();
     }
 
-    Future<void> recipe(String fg, String rm, double qty) async {
-      await db.insert('recipes', {
-        'finished_good_id': await idOf(fg),
-        'raw_material_id': await idOf(rm),
-        'quantity_per_unit': qty,
+    _database = null;
+  }
+
+  // --------------------------------------------------
+  // CREATE TABLES
+  // --------------------------------------------------
+
+  Future<void> _createSchema(DatabaseExecutor db) async {
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS items (
+        code TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        item_type TEXT NOT NULL DEFAULT 'raw',
+        unit TEXT NOT NULL DEFAULT 'ชิ้น',
+        current_quantity REAL NOT NULL DEFAULT 0,
+        unit_cost REAL NOT NULL DEFAULT 0,
+        min_quantity REAL NOT NULL DEFAULT 0,
+        safety_stock REAL NOT NULL DEFAULT 0,
+        reserved_quantity REAL NOT NULL DEFAULT 0,
+        lead_time_days INTEGER NOT NULL DEFAULT 1,
+        target_days REAL NOT NULL DEFAULT 7,
+        service_level_z REAL NOT NULL DEFAULT 1.65
+      )
+    ''');
+
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS recipes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        product_code TEXT NOT NULL,
+        material_code TEXT NOT NULL,
+        quantity REAL NOT NULL DEFAULT 0
+      )
+    ''');
+
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS production_batches (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        product_code TEXT,
+        product_name TEXT,
+        quantity REAL NOT NULL DEFAULT 0,
+        note TEXT,
+        created_at TEXT
+      )
+    ''');
+
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS stock_transactions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        item_code TEXT,
+        item_name TEXT,
+        tx_type TEXT NOT NULL DEFAULT '',
+        quantity REAL NOT NULL DEFAULT 0,
+        balance_after REAL NOT NULL DEFAULT 0,
+        note TEXT,
+        created_at TEXT
+      )
+    ''');
+
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS purchase_orders (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        item_code TEXT,
+        item_name TEXT,
+        quantity REAL NOT NULL DEFAULT 0,
+        unit_cost REAL NOT NULL DEFAULT 0,
+        total_cost REAL NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'pending',
+        created_at TEXT,
+        expected_date TEXT,
+        received_at TEXT
+      )
+    ''');
+  }
+
+  // --------------------------------------------------
+  // ENSURE COLUMNS
+  // --------------------------------------------------
+
+  Future<void> _ensureColumn(
+    DatabaseExecutor db,
+    String table,
+    String column,
+    String definition,
+  ) async {
+    final columns = await db.rawQuery(
+      'PRAGMA table_info("$table")',
+    );
+
+    final exists = columns.any(
+      (row) => row['name']?.toString() == column,
+    );
+
+    if (!exists) {
+      await db.execute(
+        'ALTER TABLE "$table" ADD COLUMN "$column" $definition',
+      );
+
+      print('DB MIGRATION: added $table.$column');
+    }
+  }
+
+  Future<void> _ensureAllColumns(DatabaseExecutor db) async {
+    // items
+    await _ensureColumn(
+      db, 'items', 'code', 'TEXT',
+    );
+    await _ensureColumn(
+      db, 'items', 'name', "TEXT NOT NULL DEFAULT ''",
+    );
+    await _ensureColumn(
+      db, 'items', 'item_type', "TEXT NOT NULL DEFAULT 'raw'",
+    );
+    await _ensureColumn(
+      db, 'items', 'unit', "TEXT NOT NULL DEFAULT 'ชิ้น'",
+    );
+    await _ensureColumn(
+      db, 'items', 'current_quantity', 'REAL NOT NULL DEFAULT 0',
+    );
+    await _ensureColumn(
+      db, 'items', 'unit_cost', 'REAL NOT NULL DEFAULT 0',
+    );
+    await _ensureColumn(
+      db, 'items', 'min_quantity', 'REAL NOT NULL DEFAULT 0',
+    );
+    await _ensureColumn(
+      db, 'items', 'safety_stock', 'REAL NOT NULL DEFAULT 0',
+    );
+    await _ensureColumn(
+      db, 'items', 'reserved_quantity', 'REAL NOT NULL DEFAULT 0',
+    );
+    await _ensureColumn(
+      db, 'items', 'lead_time_days', 'INTEGER NOT NULL DEFAULT 1',
+    );
+    await _ensureColumn(
+      db, 'items', 'target_days', 'REAL NOT NULL DEFAULT 7',
+    );
+    await _ensureColumn(
+      db, 'items', 'service_level_z', 'REAL NOT NULL DEFAULT 1.65',
+    );
+
+    // stock_transactions
+    await _ensureColumn(
+      db, 'stock_transactions', 'item_code', 'TEXT',
+    );
+    await _ensureColumn(
+      db, 'stock_transactions', 'item_name', 'TEXT',
+    );
+    await _ensureColumn(
+      db, 'stock_transactions', 'tx_type', "TEXT NOT NULL DEFAULT ''",
+    );
+    await _ensureColumn(
+      db, 'stock_transactions', 'quantity', 'REAL NOT NULL DEFAULT 0',
+    );
+    await _ensureColumn(
+      db, 'stock_transactions', 'balance_after', 'REAL NOT NULL DEFAULT 0',
+    );
+    await _ensureColumn(
+      db, 'stock_transactions', 'note', 'TEXT',
+    );
+    await _ensureColumn(
+      db, 'stock_transactions', 'created_at', 'TEXT',
+    );
+
+    // recipes
+    await _ensureColumn(
+      db, 'recipes', 'product_code', 'TEXT',
+    );
+    await _ensureColumn(
+      db, 'recipes', 'material_code', 'TEXT',
+    );
+    await _ensureColumn(
+      db, 'recipes', 'quantity', 'REAL NOT NULL DEFAULT 0',
+    );
+
+    // production_batches
+    await _ensureColumn(
+      db, 'production_batches', 'product_code', 'TEXT',
+    );
+    await _ensureColumn(
+      db, 'production_batches', 'product_name', 'TEXT',
+    );
+    await _ensureColumn(
+      db, 'production_batches', 'quantity', 'REAL NOT NULL DEFAULT 0',
+    );
+    await _ensureColumn(
+      db, 'production_batches', 'note', 'TEXT',
+    );
+    await _ensureColumn(
+      db, 'production_batches', 'created_at', 'TEXT',
+    );
+
+    // purchase_orders
+    await _ensureColumn(
+      db, 'purchase_orders', 'item_code', 'TEXT',
+    );
+    await _ensureColumn(
+      db, 'purchase_orders', 'item_name', 'TEXT',
+    );
+    await _ensureColumn(
+      db, 'purchase_orders', 'quantity', 'REAL NOT NULL DEFAULT 0',
+    );
+    await _ensureColumn(
+      db, 'purchase_orders', 'unit_cost', 'REAL NOT NULL DEFAULT 0',
+    );
+    await _ensureColumn(
+      db, 'purchase_orders', 'total_cost', 'REAL NOT NULL DEFAULT 0',
+    );
+    await _ensureColumn(
+      db, 'purchase_orders', 'status', "TEXT NOT NULL DEFAULT 'pending'",
+    );
+    await _ensureColumn(
+      db, 'purchase_orders', 'created_at', 'TEXT',
+    );
+    await _ensureColumn(
+      db, 'purchase_orders', 'expected_date', 'TEXT',
+    );
+    await _ensureColumn(
+      db, 'purchase_orders', 'received_at', 'TEXT',
+    );
+
+    final columns = await db.rawQuery(
+      'PRAGMA table_info(stock_transactions)',
+    );
+
+    print('=== STOCK TRANSACTIONS COLUMNS ===');
+    for (final column in columns) {
+      print(column['name']);
+    }
+    print('==================================');
+  }
+
+  // --------------------------------------------------
+  // SEED DATA
+  // --------------------------------------------------
+
+  Future<void> _seed(DatabaseExecutor db) async {
+    final result = await db.rawQuery(
+      'SELECT COUNT(*) AS total FROM items',
+    );
+
+    final count = (result.first['total'] as num?)?.toInt() ?? 0;
+
+    // ถ้ามีสินค้าแล้ว ไม่เขียนทับข้อมูลเดิม
+    if (count > 0) return;
+
+    final batch = db.batch();
+
+    final items = [
+      {
+        'code': 'PET_350',
+        'name': 'ขวดน้ำ 350 ml',
+        'item_type': 'raw',
+        'unit': 'ขวด',
+      },
+      {
+        'code': 'PET_600',
+        'name': 'ขวดน้ำ 600 ml',
+        'item_type': 'raw',
+        'unit': 'ขวด',
+      },
+      {
+        'code': 'PET_1500',
+        'name': 'ขวดน้ำ 1500 ml',
+        'item_type': 'raw',
+        'unit': 'ขวด',
+      },
+      {
+        'code': 'CAP_SCREW',
+        'name': 'ฝาขวด',
+        'item_type': 'raw',
+        'unit': 'ฝา',
+      },
+      {
+        'code': 'PVC_FILM',
+        'name': 'ฟิล์มหด PVC',
+        'item_type': 'raw',
+        'unit': 'ม้วน',
+      },
+      {
+        'code': 'PE_FILM',
+        'name': 'ฟิล์มหุ้มแพ็ก PE',
+        'item_type': 'raw',
+        'unit': 'ม้วน',
+      },
+      {
+        'code': 'FG_350',
+        'name': 'น้ำดื่ม 350 ml',
+        'item_type': 'finished',
+        'unit': 'ขวด',
+      },
+      {
+        'code': 'FG_600',
+        'name': 'น้ำดื่ม 600 ml',
+        'item_type': 'finished',
+        'unit': 'ขวด',
+      },
+      {
+        'code': 'FG_1500',
+        'name': 'น้ำดื่ม 1500 ml',
+        'item_type': 'finished',
+        'unit': 'ขวด',
+      },
+    ];
+
+    for (final item in items) {
+      batch.insert('items', {
+        ...item,
+        'current_quantity': 0,
+        'unit_cost': 0,
+        'min_quantity': 0,
+        'safety_stock': 0,
+        'reserved_quantity': 0,
+        'lead_time_days': 1,
+        'target_days': 7,
+        'service_level_z': 1.65,
       });
     }
 
-    // สูตรผลิต 1 แพ็ก
-    await recipe('WATER_350_12', 'PET_350', 12);
-    await recipe('WATER_350_12', 'CAP_SCREW', 12);
-    await recipe('WATER_350_12', 'PVC_FILM', 1);
-
-    await recipe('WATER_600_12', 'PET_600', 12);
-    await recipe('WATER_600_12', 'CAP_SCREW', 12);
-    await recipe('WATER_600_12', 'PVC_FILM', 1);
-
-    await recipe('WATER_1500_6', 'PET_1500', 6);
-    await recipe('WATER_1500_6', 'CAP_SCREW', 6);
-    await recipe('WATER_1500_6', 'PE_FILM', 1);
+    await batch.commit(noResult: true);
   }
 }

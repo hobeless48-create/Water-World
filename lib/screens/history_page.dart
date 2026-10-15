@@ -1,101 +1,89 @@
+
 import 'package:flutter/material.dart';
-import 'package:intl/intl.dart';
 import 'package:provider/provider.dart';
 
 import '../models.dart';
 import '../providers/inventory_provider.dart';
-import '../shared/widgets.dart';
-
-final _dateFmt = DateFormat('d MMM yyyy HH:mm', 'th');
 
 class HistoryPage extends StatelessWidget {
   const HistoryPage({super.key});
 
   @override
   Widget build(BuildContext context) {
-    final p = context.watch<InventoryProvider>();
+    final provider = context.watch<InventoryProvider>();
+
     return Scaffold(
-      appBar: AppBar(title: const Text('ประวัติสต็อก')),
+      appBar: AppBar(
+        title: const Text('ประวัติสต็อก'),
+        actions: [
+          IconButton(
+            onPressed: () => provider.loadHistory(),
+            icon: const Icon(Icons.refresh),
+          ),
+        ],
+      ),
       body: Column(
         children: [
-          SizedBox(
-            height: 56,
-            child: ListView(
-              scrollDirection: Axis.horizontal,
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-              children: [
-                for (final (label, value) in kHistoryFilters)
-                  Padding(
-                    padding: const EdgeInsets.only(right: 8),
-                    child: ChoiceChip(
-                      label: Text(label),
-                      selected: p.historyFilter == value,
-                      onSelected: (_) => p.loadHistory(value),
-                    ),
-                  ),
-              ],
+          Padding(
+            padding: const EdgeInsets.all(12),
+            child: DropdownButtonFormField<String>(
+              value: provider.historyFilter,
+              decoration: const InputDecoration(
+                labelText: 'กรองประวัติ',
+                border: OutlineInputBorder(),
+              ),
+              items: kHistoryFilters.entries.map((entry) {
+                return DropdownMenuItem(
+                  value: entry.key,
+                  child: Text(entry.value),
+                );
+              }).toList(),
+              onChanged: (value) {
+                if (value != null) {
+                  provider.loadHistory(value);
+                }
+              },
             ),
           ),
           Expanded(
-            child: p.historyItems.isEmpty
-                ? const Center(child: Text('ยังไม่มีรายการความเคลื่อนไหว'))
+            child: provider.historyItems.isEmpty
+                ? const Center(
+                    child: Text('ยังไม่มีประวัติการเคลื่อนไหว'),
+                  )
                 : ListView.builder(
-                    padding: const EdgeInsets.all(8),
-                    itemCount: p.historyItems.length,
-                    itemBuilder: (context, i) =>
-                        _txCard(context, p.historyItems[i]),
+                    itemCount: provider.historyItems.length,
+                    itemBuilder: (context, index) {
+                      final tx = provider.historyItems[index];
+                      final isPositive = tx.quantity >= 0;
+
+                      return ListTile(
+                        leading: Icon(
+                          isPositive
+                              ? Icons.add_circle_outline
+                              : Icons.remove_circle_outline,
+                          color: isPositive
+                              ? Colors.green
+                              : Colors.red,
+                        ),
+                        title: Text(tx.itemName),
+                        subtitle: Text(
+                          '${kTxLabels[tx.txType] ?? tx.txType}\n'
+                          '${tx.createdAt}\n'
+                          '${tx.note}',
+                        ),
+                        isThreeLine: true,
+                        trailing: Text(
+                          '${isPositive ? '+' : ''}'
+                          '${tx.quantity.toStringAsFixed(2)}\n'
+                          'คงเหลือ ${tx.balanceAfter.toStringAsFixed(2)}',
+                          textAlign: TextAlign.end,
+                        ),
+                      );
+                    },
                   ),
           ),
         ],
       ),
     );
   }
-
-  Widget _txCard(BuildContext context, StockTx tx) {
-    final color = _colorOf(tx.transactionType);
-    final isIn = tx.quantityChange > 0;
-    final note = (tx.note == null || tx.note!.isEmpty) ? '' : '\n${tx.note}';
-    return Card(
-      child: ListTile(
-        leading: CircleAvatar(
-          backgroundColor: color.withValues(alpha: 0.15),
-          child: Icon(_iconOf(tx.transactionType), color: color, size: 20),
-        ),
-        title: Text(tx.itemName),
-        subtitle: Text(
-          '${kTxLabels[tx.transactionType] ?? tx.transactionType} • ${_dateFmt.format(DateTime.parse(tx.createdAt))}$note',
-          style: Theme.of(context).textTheme.bodySmall,
-        ),
-        trailing: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          crossAxisAlignment: CrossAxisAlignment.end,
-          children: [
-            Text(
-              '${isIn ? '+' : ''}${qtyFmt.format(tx.quantityChange)}',
-              style: TextStyle(
-                  color: color, fontWeight: FontWeight.bold, fontSize: 16),
-            ),
-            Text('เหลือ ${qtyFmt.format(tx.quantityAfter)}',
-                style: const TextStyle(fontSize: 12)),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Color _colorOf(String type) => switch (type) {
-        'receive' => Colors.green,
-        'production_consume' => Colors.orange,
-        'production_output' => Colors.blue,
-        'sale_dispatch' => Colors.purple,
-        _ => Colors.blueGrey,
-      };
-
-  IconData _iconOf(String type) => switch (type) {
-        'receive' => Icons.arrow_downward,
-        'production_consume' => Icons.factory,
-        'production_output' => Icons.water_drop,
-        'sale_dispatch' => Icons.local_shipping,
-        _ => Icons.tune,
-      };
 }

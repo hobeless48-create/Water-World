@@ -1,206 +1,556 @@
+
+import 'dart:convert';
+import 'dart:math' as math;
+
 import 'package:sqflite/sqflite.dart';
 
 import '../models.dart';
 import 'app_db.dart';
 
-/// ทุกการเคลื่อนไหวสต็อกจะถูกบันทึกลง stock_transactions พร้อม ๆ กับ
-/// อัปเดต items.current_quantity ใน database transaction เดียวเสมอ
 class StockRepository {
-  StockRepository([AppDb? db]) : _app = db ?? AppDb.instance;
+  final AppDb appDb;
 
-  final AppDb _app;
-  Future<Database> get _db => _app.database;
+  StockRepository({AppDb? appDb})
+      : appDb = appDb ?? AppDb.instance;
 
-  Future<List<Item>> items(String itemType) async {
-    final rows = await (await _db).query('items',
-        where: 'item_type = ?', whereArgs: [itemType], orderBy: 'id');
+  // อ่านรายการสินค้า
+  Future<List<Item>> items({String? type}) async {
+    final db = await appDb.database;
+
+    String? where;
+    List<Object?>? whereArgs;
+
+    if (type == 'raw' ||
+        type == 'raw_material' ||
+        type == 'วัตถุดิบ') {
+      where = "item_type IN ('raw', 'raw_material', 'วัตถุดิบ')";
+    } else if (type == 'finished' ||
+        type == 'finished_good' ||
+        type == 'สินค้าสำเร็จรูป') {
+      where =
+          "item_type IN ('finished', 'finished_good', 'สินค้าสำเร็จรูป')";
+    } else if (type != null) {
+      where = 'item_type = ?';
+      whereArgs = [type];
+    }
+
+    final rows = await db.query(
+      'items',
+      where: where,
+      whereArgs: whereArgs,
+      orderBy: 'name',
+    );
+
     return rows.map(Item.fromMap).toList();
   }
 
-  Future<Item> itemByCode(String code) async {
-    final rows = await (await _db).query('items',
-        where: 'code = ?', whereArgs: [code], limit: 1);
-    if (rows.isEmpty) throw AppException('ไม่พบรายการ $code');
+  // นับจำนวนสินค้า
+  Future<int> countItems() async {
+    final db = await appDb.database;
+    final result =
+        await db.rawQuery('SELECT COUNT(*) AS total FROM items');
+
+    return (result.first['total'] as num).toInt();
+  }
+
+  // ค้นหาสินค้าจากรหัส
+  Future<Item?> itemByCode(String code) async {
+    final db = await appDb.database;
+
+    final rows = await db.query(
+      'items',
+      where: 'code = ?',
+      whereArgs: [code],
+      limit: 1,
+    );
+
+    if (rows.isEmpty) return null;
     return Item.fromMap(rows.first);
   }
 
-  /// สูตรผลิตของสินค้า 1 ชนิด พร้อมสต็อกปัจจุบันของวัตถุดิบแต่ละตัว
-  Future<List<RecipeLine>> recipeFor(int finishedId,
-      [DatabaseExecutor? exec]) async {
-    final db = exec ?? await _db;
-    final rows = await db.rawQuery('''
-      SELECT r.raw_material_id, i.name, i.unit, r.quantity_per_unit, i.current_quantity
-      FROM recipes r JOIN items i ON i.id = r.raw_material_id
-      WHERE r.finished_good_id = ? ORDER BY r.id''', [finishedId]);
+  // อ่านสูตรการผลิตของสินค้า
+  Future<List<RecipeLine>> recipeFor(String finishedCode) async {
+    final db = await appDb.database;
+
+    final rows = await db.rawQuery(
+      '''
+      SELECT
+        r.*,
+        r.material_code AS raw_code,
+        r.product_code AS finished_code,
+        i.name AS raw_name,
+        i.unit AS raw_unit
+      FROM recipes r
+      JOIN items i ON i.code = r.material_code
+      WHERE r.product_code = ?
+      ''',
+      [finishedCode],
+    );
+
     return rows.map(RecipeLine.fromMap).toList();
   }
 
-  Future<Map<int, List<RecipeLine>>> allRecipes() async {
-    final db = await _db;
-    final rows = await db
-        .query('items', columns: ['id'], where: 'item_type = ?',
-            whereArgs: ['finished_good']);
-    final map = <int, List<RecipeLine>>{};
-    for (final r in rows) {
-      final id = r['id'] as int;
-      map[id] = await recipeFor(id, db);
-    }
-    return map;
+  // อ่านสูตรการผลิตทั้งหมด
+  Future<List<RecipeLine>> allRecipes() async {
+    final db = await appDb.database;
+
+    final rows = await db.rawQuery('''
+      SELECT
+        r.*,
+        r.material_code AS raw_code,
+        r.product_code AS finished_code,
+        i.name AS raw_name,
+        i.unit AS raw_unit
+      FROM recipes r
+      JOIN items i ON i.code = r.material_code
+      ORDER BY r.product_code
+    ''');
+
+    return rows.map(RecipeLine.fromMap).toList();
   }
 
-  /// รับเข้าวัตถุดิบ
+  // รับสินค้าเข้าคลัง
   Future<void> receive(
-      {required int itemId,
-      required double qty,
-      double? unitCost,
-      String? note}) async {
-    if (qty <= 0) throw AppException('จำนวนต้องมากกว่า 0');
-    final db = await _db;
-    await db.transaction((txn) => _apply(txn,
-        itemId: itemId,
-        delta: qty,
-        type: 'receive',
-        unitCost: unitCost,
-        note: note));
+    String code,
+    double quantity, {
+    String note = '',
+  }) async {
+    if (quantity <= 0) {
+      throw AppException('จำนวนรับเข้าต้องมากกว่า 0');
+    }
+
+    await _change(code, quantity, 'receive', note);
   }
 
-  /// ผลิตสินค้าสำเร็จรูป: ตัดวัตถุดิบตามสูตร + เพิ่มสินค้า ใน transaction เดียว
-  Future<String> produce(
-      {required int finishedId, required double packs, String? note}) async {
-    if (packs <= 0) throw AppException('จำนวนแพ็กต้องมากกว่า 0');
-    final db = await _db;
-    final now = DateTime.now();
-    String two(int n) => n.toString().padLeft(2, '0');
-    final batchNo =
-        'BATCH-${now.year}${two(now.month)}${two(now.day)}-${two(now.hour)}${two(now.minute)}${two(now.second)}';
+  // จ่ายสินค้าออกจากคลัง
+  Future<void> dispatch(
+    String code,
+    double quantity, {
+    String note = '',
+  }) async {
+    if (quantity <= 0) {
+      throw AppException('จำนวนจ่ายออกต้องมากกว่า 0');
+    }
 
-    return db.transaction<String>((txn) async {
-      final lines = await recipeFor(finishedId, txn);
-      if (lines.isEmpty) throw AppException('สินค้านี้ยังไม่มีสูตรการผลิต');
+    await _change(code, -quantity, 'dispatch', note);
+  }
 
-      final missing = <String>[];
-      for (final l in lines) {
-        final have = await _qty(txn, l.rawMaterialId);
-        if (have < l.requiredFor(packs)) {
-          missing.add(
-              '${l.name} ขาด ${_num(l.requiredFor(packs) - have)} ${l.unit}');
-        }
-      }
-      if (missing.isNotEmpty) {
-        throw AppException('วัตถุดิบไม่พอสำหรับการผลิต:\n${missing.join('\n')}');
+  // ปรับยอดคงเหลือ
+  Future<void> adjust(
+    String code,
+    double newBalance, {
+    String note = '',
+  }) async {
+    if (newBalance < 0) {
+      throw AppException('ยอดคงเหลือห้ามติดลบ');
+    }
+
+    final item = await itemByCode(code);
+
+    if (item == null) {
+      throw AppException('ไม่พบสินค้า $code');
+    }
+
+    final delta = newBalance - item.currentQuantity;
+
+    if (delta == 0) return;
+
+    await _change(code, delta, 'adjust', note);
+  }
+
+  // อ่านชื่อคอลัมน์ ใช้ได้ทั้ง Database และ Transaction
+  Future<Set<String>> _tableColumns(
+    DatabaseExecutor db,
+    String tableName,
+  ) async {
+    final result = await db.rawQuery(
+      'PRAGMA table_info("$tableName")',
+    );
+
+    return result
+        .map((row) => row['name'] as String)
+        .toSet();
+  }
+
+  // สร้างแถวประวัติให้ตรงกับคอลัมน์ที่มีอยู่ในฐานข้อมูล
+  Future<void> _insertStockTransaction(
+    DatabaseExecutor txn, {
+    required String code,
+    required String name,
+    required String type,
+    required double quantity,
+    required double before,
+    required double after,
+    String note = '',
+    Object? itemId,
+  }) async {
+    final columns = await _tableColumns(txn, 'stock_transactions');
+
+    final row = <String, Object?>{
+      'item_code': code,
+      'item_name': name,
+      'tx_type': type,
+      'quantity': quantity,
+      'balance_after': after,
+      'note': note,
+      'created_at': DateTime.now().toIso8601String(),
+
+      // รองรับคอลัมน์จากฐานข้อมูลรุ่นเก่า
+      'item_id': itemId,
+      'transaction_type': type,
+      'quantity_change': quantity,
+      'quantity_before': before,
+      'quantity_after': after,
+      'unit_price_or_cost': 0,
+      'reference_id': null,
+    };
+
+    row.removeWhere((key, value) => !columns.contains(key));
+
+    await txn.insert('stock_transactions', row);
+  }
+
+  // เปลี่ยนยอดสต๊อกและบันทึกประวัติ
+  Future<void> _change(
+    String code,
+    double delta,
+    String type,
+    String note,
+  ) async {
+    if (delta == 0) {
+      throw AppException('ไม่มีการเปลี่ยนแปลงจำนวนสินค้า');
+    }
+
+    final db = await appDb.database;
+
+    await db.transaction((txn) async {
+      final rows = await txn.query(
+        'items',
+        where: 'code = ?',
+        whereArgs: [code],
+        limit: 1,
+      );
+
+      if (rows.isEmpty) {
+        throw AppException('ไม่พบสินค้า $code');
       }
 
-      for (final l in lines) {
-        await _apply(txn,
-            itemId: l.rawMaterialId,
-            delta: -l.requiredFor(packs),
-            type: 'production_consume',
-            ref: batchNo,
-            note: note);
+      final row = rows.first;
+      final current = (row['current_quantity'] as num).toDouble();
+      final next = current + delta;
+
+      if (next < 0) {
+        throw AppException('สต๊อกไม่เพียงพอ');
       }
-      await _apply(txn,
-          itemId: finishedId,
-          delta: packs,
-          type: 'production_output',
-          ref: batchNo,
-          note: note);
-      await txn.insert('production_batches', {
-        'batch_number': batchNo,
-        'finished_good_id': finishedId,
-        'quantity_produced': packs,
-        if (note != null && note.trim().isNotEmpty) 'note': note.trim(),
-        'created_at': DateTime.now().toIso8601String(),
-      });
-      return batchNo;
+
+      await txn.update(
+        'items',
+        {'current_quantity': next},
+        where: 'code = ?',
+        whereArgs: [code],
+      );
+
+      await _insertStockTransaction(
+        txn,
+        code: code,
+        name: row['name']?.toString() ?? code,
+        type: type,
+        quantity: delta,
+        before: current,
+        after: next,
+        note: note,
+        itemId: row['id'],
+      );
     });
   }
 
-  /// ขาย/ส่งสินค้าสำเร็จรูปให้ลูกค้า
-  Future<void> dispatch(
-      {required int itemId, required double qty, String? note}) async {
-    if (qty <= 0) throw AppException('จำนวนต้องมากกว่า 0');
-    final db = await _db;
-    await db.transaction((txn) =>
-        _apply(txn, itemId: itemId, delta: -qty, type: 'sale_dispatch', note: note));
-  }
-
-  /// ปรับยอด (บวก/ลบ) ต้องระบุเหตุผล
-  Future<void> adjust(
-      {required int itemId, required double delta, required String reason}) async {
-    if (delta == 0) throw AppException('จำนวนการปรับต้องไม่เท่ากับ 0');
-    if (reason.trim().isEmpty) throw AppException('ต้องระบุเหตุผลการปรับยอด');
-    final db = await _db;
-    await db.transaction((txn) => _apply(txn,
-        itemId: itemId, delta: delta, type: 'adjustment', note: reason.trim()));
-  }
-
-  /// ประวัติความเคลื่อนไหว (ล่าสุดก่อน)
-  Future<List<StockTx>> history({String? type, int limit = 300}) async {
-    var where = '';
-    final args = <Object?>[];
-    if (type == 'production') {
-      where = "WHERE t.transaction_type LIKE 'production_%'";
-    } else if (type != null) {
-      where = 'WHERE t.transaction_type = ?';
-      args.add(type);
+  // ผลิตสินค้า ตัดวัตถุดิบและเพิ่มสินค้าสำเร็จรูป
+  Future<void> produce(
+    String finishedCode,
+    double quantity, {
+    String note = '',
+  }) async {
+    if (quantity <= 0) {
+      throw AppException('จำนวนผลิตต้องมากกว่า 0');
     }
-    final rows = await (await _db).rawQuery('''
-      SELECT t.id, t.transaction_type, t.quantity_change, t.quantity_after,
-             t.note, t.reference_id, t.created_at,
-             i.name AS item_name, i.item_type
-      FROM stock_transactions t JOIN items i ON i.id = t.item_id
-      $where ORDER BY t.id DESC LIMIT ?''', [...args, limit]);
+
+    final db = await appDb.database;
+
+    await db.transaction((txn) async {
+      final finishedRows = await txn.query(
+        'items',
+        where: 'code = ?',
+        whereArgs: [finishedCode],
+        limit: 1,
+      );
+
+      if (finishedRows.isEmpty) {
+        throw AppException('ไม่พบสินค้าสำเร็จรูป');
+      }
+
+      final recipes = await txn.query(
+        'recipes',
+        where: 'product_code = ?',
+        whereArgs: [finishedCode],
+      );
+
+      if (recipes.isEmpty) {
+        throw AppException('ไม่พบสูตรการผลิต');
+      }
+
+      // ตรวจสอบวัตถุดิบก่อนตัดสต๊อก
+      for (final recipe in recipes) {
+        final rawCode = recipe['material_code'] as String;
+        final needed =
+            (recipe['quantity'] as num).toDouble() * quantity;
+
+        final rawRows = await txn.query(
+          'items',
+          where: 'code = ?',
+          whereArgs: [rawCode],
+          limit: 1,
+        );
+
+        if (rawRows.isEmpty) {
+          throw AppException('ไม่พบวัตถุดิบ $rawCode');
+        }
+
+        final current =
+            (rawRows.first['current_quantity'] as num).toDouble();
+
+        if (current < needed) {
+          throw AppException(
+            'วัตถุดิบ ${rawRows.first['name']} ไม่เพียงพอ',
+          );
+        }
+      }
+
+      // ตัดวัตถุดิบ
+      for (final recipe in recipes) {
+        final rawCode = recipe['material_code'] as String;
+        final needed =
+            (recipe['quantity'] as num).toDouble() * quantity;
+
+        final rawRows = await txn.query(
+          'items',
+          where: 'code = ?',
+          whereArgs: [rawCode],
+          limit: 1,
+        );
+
+        final raw = rawRows.first;
+        final current =
+            (raw['current_quantity'] as num).toDouble();
+        final next = current - needed;
+
+        await txn.update(
+          'items',
+          {'current_quantity': next},
+          where: 'code = ?',
+          whereArgs: [rawCode],
+        );
+
+        await _insertStockTransaction(
+          txn,
+          code: rawCode,
+          name: raw['name']?.toString() ?? rawCode,
+          type: 'production_consume',
+          quantity: -needed,
+          before: current,
+          after: next,
+          note: 'ใช้ผลิต $finishedCode จำนวน $quantity $note',
+          itemId: raw['id'],
+        );
+      }
+
+      // เพิ่มสินค้าสำเร็จรูป
+      final finished = finishedRows.first;
+      final currentFinished =
+          (finished['current_quantity'] as num).toDouble();
+      final nextFinished = currentFinished + quantity;
+
+      await txn.update(
+        'items',
+        {'current_quantity': nextFinished},
+        where: 'code = ?',
+        whereArgs: [finishedCode],
+      );
+
+      await _insertStockTransaction(
+        txn,
+        code: finishedCode,
+        name: finished['name']?.toString() ?? finishedCode,
+        type: 'production_output',
+        quantity: quantity,
+        before: currentFinished,
+        after: nextFinished,
+        note: note,
+        itemId: finished['id'],
+      );
+
+      // บันทึกประวัติการผลิตให้ตรงกับ app_db.dart
+      await txn.insert('production_batches', {
+        'product_code': finishedCode,
+        'product_name': finished['name']?.toString() ?? finishedCode,
+        'quantity': quantity,
+        'note': note,
+        'created_at': DateTime.now().toIso8601String(),
+      });
+    });
+  }
+
+  // อ่านประวัติการเคลื่อนไหวของสินค้า
+  Future<List<StockTx>> history({
+    String filter = 'all',
+    int limit = 200,
+  }) async {
+    final db = await appDb.database;
+    final columns = await _tableColumns(db, 'stock_transactions');
+
+    final typeColumn = columns.contains('tx_type')
+        ? 'tx_type'
+        : 'transaction_type';
+
+    final rows = await db.rawQuery(
+      '''
+      SELECT * FROM stock_transactions
+      ${filter == 'all' ? '' : 'WHERE $typeColumn = ?'}
+      ORDER BY id DESC
+      LIMIT ?
+      ''',
+      filter == 'all' ? [limit] : [filter, limit],
+    );
+
     return rows.map(StockTx.fromMap).toList();
   }
 
-  Future<double> _qty(DatabaseExecutor db, int itemId) async {
-    final rows = await db.query('items',
-        columns: ['current_quantity'], where: 'id = ?', whereArgs: [itemId]);
-    if (rows.isEmpty) throw AppException('ไม่พบสินค้ารหัส $itemId');
-    return (rows.first['current_quantity'] as num).toDouble();
-  }
-
-  /// อัปเดตยอดคงเหลือ + บันทึก ledger ในที่เดียว
-  Future<void> _apply(
-    DatabaseExecutor db, {
-    required int itemId,
-    required double delta,
-    required String type,
-    double? unitCost,
-    String? ref,
-    String? note,
+  // สรุปการใช้วัตถุดิบรายวัน
+  Future<Map<String, double>> consumptionStats(
+    String code, {
+    int days = 30,
   }) async {
-    final rows = await db.query('items', where: 'id = ?', whereArgs: [itemId]);
-    if (rows.isEmpty) throw AppException('ไม่พบสินค้ารหัส $itemId');
-    final row = rows.first;
-    final before = (row['current_quantity'] as num).toDouble();
-    final after = before + delta;
-    if (after < 0) {
-      throw AppException(
-          '${row['name']}: คงเหลือ ${_num(before)} ${row['unit']} ไม่พอ (ต้องใช้ ${_num(-delta)})');
+    if (days <= 0) {
+      throw ArgumentError('days ต้องมากกว่า 0');
     }
-    final now = DateTime.now().toIso8601String();
-    final update = <String, Object?>{
-      'current_quantity': after,
-      'updated_at': now,
-    };
-    if (unitCost != null) update['unit_cost'] = unitCost;
-    await db.update('items', update, where: 'id = ?', whereArgs: [itemId]);
 
-    final tx = <String, Object?>{
-      'item_id': itemId,
-      'transaction_type': type,
-      'quantity_change': delta,
-      'quantity_before': before,
-      'quantity_after': after,
-      'created_at': now,
+    final db = await appDb.database;
+    final columns = await _tableColumns(db, 'stock_transactions');
+
+    final codeColumn =
+        columns.contains('item_code') ? 'item_code' : null;
+    final typeColumn =
+        columns.contains('tx_type') ? 'tx_type' : 'transaction_type';
+    final quantityColumn =
+        columns.contains('quantity') ? 'quantity' : 'quantity_change';
+
+    if (codeColumn == null) {
+      throw AppException(
+        'ตารางประวัติสินค้าไม่มีคอลัมน์ item_code กรุณาตรวจสอบฐานข้อมูล',
+      );
+    }
+
+    final cutoff = DateTime.now()
+        .subtract(Duration(days: days - 1))
+        .toIso8601String()
+        .substring(0, 10);
+
+    final rows = await db.rawQuery(
+      '''
+      SELECT date(created_at) AS day,
+             SUM(-$quantityColumn) AS used
+      FROM stock_transactions
+      WHERE $codeColumn = ?
+        AND $typeColumn = 'production_consume'
+        AND $quantityColumn < 0
+        AND date(created_at) >= date(?)
+      GROUP BY date(created_at)
+      ''',
+      [code, cutoff],
+    );
+
+    final daily = <String, double>{};
+
+    for (final row in rows) {
+      final day = row['day'];
+      final used = row['used'];
+
+      if (day != null && used != null) {
+        daily[day as String] = (used as num).toDouble();
+      }
+    }
+
+    final values = <double>[];
+
+    for (var i = 0; i < days; i++) {
+      final date = DateTime.now()
+          .subtract(Duration(days: days - 1 - i))
+          .toIso8601String()
+          .substring(0, 10);
+
+      values.add(daily[date] ?? 0);
+    }
+
+    final average =
+        values.fold<double>(0, (sum, value) => sum + value) / days;
+
+    final variance = values.fold<double>(
+          0,
+          (sum, value) =>
+              sum + math.pow(value - average, 2).toDouble(),
+        ) /
+        days;
+
+    return {
+      'average': average,
+      'stddev': math.sqrt(variance),
     };
-    if (unitCost != null) tx['unit_price_or_cost'] = unitCost;
-    if (ref != null) tx['reference_id'] = ref;
-    if (note != null && note.trim().isNotEmpty) tx['note'] = note.trim();
-    await db.insert('stock_transactions', tx);
   }
 
-  String _num(double n) =>
-      n == n.roundToDouble() ? n.toStringAsFixed(0) : n.toString();
+  // บันทึกนโยบาย Safety Stock
+  Future<void> saveStockPolicy({
+    required String code,
+    required int leadTimeDays,
+    required int targetDays,
+    required double serviceLevelZ,
+    double? safetyStock,
+    double? minQuantity,
+  }) async {
+    final db = await appDb.database;
+
+    await db.update(
+      'items',
+      {
+        'lead_time_days': leadTimeDays,
+        'target_days': targetDays,
+        'service_level_z': serviceLevelZ,
+        'safety_stock': safetyStock ?? 0,
+        'min_quantity': minQuantity ?? 0,
+      },
+      where: 'code = ?',
+      whereArgs: [code],
+    );
+  }
+
+  // สร้างใบสั่งซื้อแบบร่าง
+  Future<int> createPurchaseOrder(
+    List<Map<String, Object?>> items,
+  ) async {
+    final db = await appDb.database;
+
+    return db.insert('purchase_orders', {
+      'status': 'draft',
+      'items_json': jsonEncode(items),
+      'created_at': DateTime.now().toIso8601String(),
+    });
+  }
+
+  // อ่านใบสั่งซื้อ
+  Future<List<Map<String, Object?>>> purchaseOrders() async {
+    final db = await appDb.database;
+
+    return db.query(
+      'purchase_orders',
+      orderBy: 'id DESC',
+    );
+  }
 }

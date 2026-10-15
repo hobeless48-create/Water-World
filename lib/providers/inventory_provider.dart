@@ -1,63 +1,196 @@
+
+import 'dart:math' as math;
+
 import 'package:flutter/foundation.dart';
 
 import '../data/stock_repository.dart';
 import '../models.dart';
 
 class InventoryProvider extends ChangeNotifier {
-  final StockRepository repo = StockRepository();
+  final StockRepository repo;
+
+  InventoryProvider({StockRepository? repo})
+      : repo = repo ?? StockRepository();
 
   List<Item> raw = [];
   List<Item> finished = [];
-  Map<int, List<RecipeLine>> recipes = {};
+  List<RecipeLine> recipes = [];
   List<StockTx> historyItems = [];
-  String? historyFilter;
-  bool loading = true;
+  List<StockRisk> stockRisks = [];
+
+  String historyFilter = 'all';
+  bool loading = false;
 
   Future<void> refresh() async {
     loading = true;
     notifyListeners();
+
     try {
-      raw = await repo.items('raw_material');
-      finished = await repo.items('finished_good');
+      raw = await repo.items(type: 'raw');
+      finished = await repo.items(type: 'finished');
       recipes = await repo.allRecipes();
-      historyItems = await repo.history(type: historyFilter);
+
+      await refreshStockRisks(notify: false);
+
+      historyItems = await repo.history(
+        filter: historyFilter,
+      );
     } finally {
       loading = false;
       notifyListeners();
     }
   }
 
-  Future<void> loadHistory(String? filter) async {
-    historyFilter = filter;
-    historyItems = await repo.history(type: filter);
+  Future<void> refreshStockRisks({
+    bool notify = true,
+  }) async {
+    final items = await repo.items(type: 'raw');
+    final results = <StockRisk>[];
+
+    for (final item in items) {
+      final stats = await repo.consumptionStats(
+        item.code,
+        days: 30,
+      );
+
+      final average = stats['average'] ?? 0;
+      final deviation = stats['stddev'] ?? 0;
+
+      // Safety Stock = Z × SD × sqrt(Lead Time)
+      final calculatedSafety = item.serviceLevelZ *
+          deviation *
+          math.sqrt(item.leadTimeDays.toDouble());
+
+      final safety = item.safetyStock > 0
+          ? item.safetyStock
+          : calculatedSafety;
+
+      // ใช้จุดสั่งซื้อที่กำหนดเอง หากเป็น 0 จะคำนวณอัตโนมัติ
+      final calculatedReorder =
+          average * item.leadTimeDays + safety;
+
+      final reorder = item.minQuantity > 0
+          ? item.minQuantity
+          : calculatedReorder;
+
+      // ปริมาณเป้าหมายสำรอง
+      final target = average * item.targetDays + safety;
+
+      final suggested = math.max(
+        0.0,
+        target - item.currentQuantity,
+      );
+
+      final StockRiskLevel level;
+
+      if (item.currentQuantity <= safety) {
+        level = StockRiskLevel.critical;
+      } else if (item.currentQuantity <= reorder) {
+        level = StockRiskLevel.warning;
+      } else {
+        level = StockRiskLevel.normal;
+      }
+
+      results.add(
+        StockRisk(
+          item: item,
+          averageDailyUsage: average,
+          standardDeviation: deviation,
+          safetyStock: safety,
+          reorderPoint: reorder,
+          targetStock: target,
+          suggestedOrderQuantity: suggested,
+          level: level,
+        ),
+      );
+    }
+
+    stockRisks = results;
+
+    if (notify) {
+      notifyListeners();
+    }
+  }
+
+  Future<void> loadHistory([String? filter]) async {
+    if (filter != null) {
+      historyFilter = filter;
+    }
+
+    historyItems = await repo.history(
+      filter: historyFilter,
+    );
+
     notifyListeners();
   }
 
   Future<void> receive(
-      {required int itemId,
-      required double qty,
-      double? unitCost,
-      String? note}) async {
-    await repo.receive(itemId: itemId, qty: qty, unitCost: unitCost, note: note);
+    String code,
+    double quantity, {
+    String note = '',
+  }) async {
+    await repo.receive(code, quantity, note: note);
     await refresh();
   }
 
-  Future<String> produce(
-      {required int finishedId, required double packs, String? note}) async {
-    final batch = await repo.produce(finishedId: finishedId, packs: packs, note: note);
+  Future<void> produce(
+    String code,
+    double quantity, {
+    String note = '',
+  }) async {
+    await repo.produce(code, quantity, note: note);
     await refresh();
-    return batch;
   }
 
   Future<void> dispatch(
-      {required int itemId, required double qty, String? note}) async {
-    await repo.dispatch(itemId: itemId, qty: qty, note: note);
+    String code,
+    double quantity, {
+    String note = '',
+  }) async {
+    await repo.dispatch(code, quantity, note: note);
     await refresh();
   }
 
   Future<void> adjust(
-      {required int itemId, required double delta, required String reason}) async {
-    await repo.adjust(itemId: itemId, delta: delta, reason: reason);
+    String code,
+    double newBalance, {
+    String note = '',
+  }) async {
+    await repo.adjust(code, newBalance, note: note);
     await refresh();
+  }
+
+  Future<void> saveStockPolicy({
+    required String code,
+    required int leadTimeDays,
+    required int targetDays,
+    required double serviceLevelZ,
+    double? safetyStock,
+    double? minQuantity,
+  }) async {
+    await repo.saveStockPolicy(
+      code: code,
+      leadTimeDays: leadTimeDays,
+      targetDays: targetDays,
+      serviceLevelZ: serviceLevelZ,
+      safetyStock: safetyStock,
+      minQuantity: minQuantity,
+    );
+
+    await refresh();
+  }
+
+  // สร้างใบสั่งซื้อและบันทึกลงฐานข้อมูล
+  Future<int> createPurchaseOrder(
+    List<Map<String, Object?>> items,
+  ) async {
+    final id = await repo.createPurchaseOrder(items);
+    await refreshStockRisks();
+    return id;
+  }
+
+  // อ่านรายการสั่งซื้อทั้งหมดจากฐานข้อมูล SQLite
+  Future<List<Map<String, Object?>>> purchaseOrders() async {
+    return repo.purchaseOrders();
   }
 }

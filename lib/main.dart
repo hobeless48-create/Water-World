@@ -1,17 +1,21 @@
+
 import 'package:flutter/material.dart';
-import 'package:intl/date_symbol_data_local.dart';
 import 'package:provider/provider.dart';
 
 import 'providers/inventory_provider.dart';
 import 'screens/history_page.dart';
 import 'screens/inventory_page.dart';
+import 'screens/stock_alert_page.dart';
 
-Future<void> main() async {
+void main() {
   WidgetsFlutterBinding.ensureInitialized();
-  // ต้อง initialize ข้อมูลวันที่ของ locale 'th' ก่อนใช้ DateFormat(..., 'th')
-  // ไม่งั้นหน้าประวัติจะ throw LocaleDataException
-  await initializeDateFormatting('th');
-  runApp(const WaterWorldApp());
+
+  runApp(
+    ChangeNotifierProvider(
+      create: (_) => InventoryProvider()..refresh(),
+      child: const WaterWorldApp(),
+    ),
+  );
 }
 
 class WaterWorldApp extends StatelessWidget {
@@ -19,51 +23,63 @@ class WaterWorldApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    // Provider ต้องอยู่เหนือ MaterialApp เพื่อให้ทุก route ที่ push ใหม่เข้าถึงได้
-    return ChangeNotifierProvider(
-      create: (_) => InventoryProvider()..refresh(),
-      child: MaterialApp(
-        title: 'ร้านน้ำดื่ม',
-        debugShowCheckedModeBanner: false,
-        theme: ThemeData(
-          useMaterial3: true,
-          colorSchemeSeed: const Color(0xFF0288D1),
+    return MaterialApp(
+      title: 'Water World',
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: Colors.teal,
         ),
-        home: const _Shell(),
+        useMaterial3: true,
       ),
+      home: const MainShell(),
     );
   }
 }
 
-class _Shell extends StatefulWidget {
-  const _Shell();
+class MainShell extends StatefulWidget {
+  const MainShell({super.key});
 
   @override
-  State<_Shell> createState() => _ShellState();
+  State<MainShell> createState() => _MainShellState();
 }
 
-class _ShellState extends State<_Shell> {
-  int _index = 0;
+class _MainShellState extends State<MainShell> {
+  int index = 0;
+
+  final pages = const [
+    InventoryPage(),
+    StockAlertPage(),
+    HistoryPage(),
+  ];
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       body: IndexedStack(
-        index: _index,
-        children: const [InventoryPage(), HistoryPage()],
+        index: index,
+        children: pages,
       ),
       bottomNavigationBar: NavigationBar(
-        selectedIndex: _index,
-        onDestinationSelected: (i) => setState(() => _index = i),
+        selectedIndex: index,
+        onDestinationSelected: (value) {
+          setState(() => index = value);
+        },
         destinations: const [
           NavigationDestination(
-              icon: Icon(Icons.warehouse_outlined),
-              selectedIcon: Icon(Icons.warehouse),
-              label: 'คลังสินค้า'),
+            icon: Icon(Icons.inventory_2_outlined),
+            selectedIcon: Icon(Icons.inventory_2),
+            label: 'คลังสินค้า',
+          ),
           NavigationDestination(
-              icon: Icon(Icons.history_outlined),
-              selectedIcon: Icon(Icons.history),
-              label: 'ประวัติสต็อก'),
+            icon: Icon(Icons.notifications_active_outlined),
+            selectedIcon: Icon(Icons.notifications_active),
+            label: 'แจ้งเตือน',
+          ),
+          NavigationDestination(
+            icon: Icon(Icons.history),
+            label: 'ประวัติ',
+          ),
         ],
       ),
     );
